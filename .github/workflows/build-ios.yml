@@ -22,6 +22,90 @@ jobs:
       - name: Install XcodeGen
         run: brew install xcodegen
 
+      # Патч: добавляем runtime-определение team prefix для сайдлоада
+      - name: Patch OpenMausSharedConfiguration for sideloading
+        run: |
+          cat > ios/AppShared/OpenMausSharedConfiguration.swift << 'SWIFT'
+          import Foundation
+          import Security
+
+          /// Values shared by the main app and its extensions.
+          enum OpenMausSharedConfiguration {
+              static let appGroupIdentifier = "group.com.openmausbot.shared"
+              static let legacyAppBundleIdentifier = "com.openmausbot.app"
+              static let keychainAccessGroupInfoKey = "OpenMausKeychainAccessGroup"
+
+              static var sharedDefaults: UserDefaults? {
+                  UserDefaults(suiteName: appGroupIdentifier)
+              }
+
+              /// Fully-qualified keychain access group.
+              ///
+              /// Normal signed builds: reads the value Xcode expanded in Info.plist.
+              /// Sideloaded builds: $(AppIdentifierPrefix) is empty, so we discover
+              /// the team prefix at runtime by probing the keychain.
+              static var keychainAccessGroup: String? {
+                  if let value = Bundle.main.object(
+                      forInfoDictionaryKey: keychainAccessGroupInfoKey
+                  ) as? String {
+                      let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                      if !trimmed.isEmpty, !trimmed.contains("$(") {
+                          // Contains a dot before the group name → prefix was expanded
+                          if trimmed != appGroupIdentifier {
+                              return trimmed
+                          }
+                      }
+                  }
+                  // Fallback: derive from the signing team prefix
+                  guard let prefix = _discoveredTeamPrefix else { return nil }
+                  return "\(prefix)\(appGroupIdentifier)"
+              }
+
+              static var legacyAppKeychainAccessGroup: String? {
+                  guard let shared = keychainAccessGroup,
+                        shared.hasSuffix(appGroupIdentifier) else { return nil }
+                  let prefix = shared.dropLast(appGroupIdentifier.count)
+                  return "\(prefix)\(legacyAppBundleIdentifier)"
+              }
+
+              // MARK: - Team prefix discovery
+
+              /// Discover the signing team prefix by adding a disposable keychain
+              /// item and reading back the access group iOS assigned to it.
+              /// Evaluated once, cached for the process lifetime.
+              private static let _discoveredTeamPrefix: String? = {
+                  let svc = "com.openmausbot._prefix_probe"
+                  let acct = "_probe"
+                  let base: [String: Any] = [
+                      kSecClass as String: kSecClassGenericPassword,
+                      kSecAttrService as String: svc,
+                      kSecAttrAccount as String: acct,
+                  ]
+                  // Remove any leftover from a previous run
+                  SecItemDelete(base as CFDictionary)
+
+                  var addQuery = base
+                  addQuery[kSecValueData as String] = Data("p".utf8)
+                  addQuery[kSecReturnAttributes as String] = true
+
+                  var ref: CFTypeRef?
+                  let status = SecItemAdd(addQuery as CFDictionary, &ref)
+                  defer { SecItemDelete(base as CFDictionary) }
+
+                  guard status == errSecSuccess,
+                        let attrs = ref as? [String: Any],
+                        let group = attrs[kSecAttrAccessGroup as String] as? String,
+                        let bundleID = Bundle.main.bundleIdentifier,
+                        group.hasSuffix(bundleID)
+                  else { return nil }
+
+                  // group = "ABCDE12345.com.openmausbot.app"
+                  // prefix = "ABCDE12345."
+                  return String(group.dropLast(bundleID.count))
+              }()
+          }
+          SWIFT
+
       - name: Generate Xcode Project
         working-directory: ios
         run: xcodegen generate
@@ -40,13 +124,11 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             build
 
-      # Вшиваем энтайтлменты ad-hoc подписью, чтобы Sideloadly их подхватил
       - name: Ad-hoc sign with entitlements
         working-directory: ios/DerivedData/Build/Products/Release-iphoneos
         run: |
           APP="OpenMausCompanion.app"
 
-          # --- Entitlements: Main App ---
           cat > /tmp/app.entitlements << 'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -54,15 +136,15 @@ jobs:
           <plist version="1.0">
           <dict>
             <key>application-identifier</key>
-            <string>TEAM_ID.com.openmausbot.app</string>
+            <string>TEAM.com.openmausbot.app</string>
             <key>com.apple.security.application-groups</key>
             <array>
               <string>group.com.openmausbot.shared</string>
             </array>
             <key>keychain-access-groups</key>
             <array>
-              <string>TEAM_ID.com.openmausbot.app</string>
-              <string>TEAM_ID.group.com.openmausbot.shared</string>
+              <string>TEAM.com.openmausbot.app</string>
+              <string>TEAM.group.com.openmausbot.shared</string>
             </array>
             <key>get-task-allow</key>
             <true/>
@@ -70,7 +152,6 @@ jobs:
           </plist>
           EOF
 
-          # --- Entitlements: Share Extension ---
           cat > /tmp/share.entitlements << 'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -78,14 +159,14 @@ jobs:
           <plist version="1.0">
           <dict>
             <key>application-identifier</key>
-            <string>TEAM_ID.com.openmausbot.app.share</string>
+            <string>TEAM.com.openmausbot.app.share</string>
             <key>com.apple.security.application-groups</key>
             <array>
               <string>group.com.openmausbot.shared</string>
             </array>
             <key>keychain-access-groups</key>
             <array>
-              <string>TEAM_ID.group.com.openmausbot.shared</string>
+              <string>TEAM.group.com.openmausbot.shared</string>
             </array>
             <key>get-task-allow</key>
             <true/>
@@ -93,7 +174,6 @@ jobs:
           </plist>
           EOF
 
-          # --- Entitlements: Widgets ---
           cat > /tmp/widgets.entitlements << 'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -101,49 +181,38 @@ jobs:
           <plist version="1.0">
           <dict>
             <key>application-identifier</key>
-            <string>TEAM_ID.com.openmausbot.app.widgets</string>
+            <string>TEAM.com.openmausbot.app.widgets</string>
             <key>get-task-allow</key>
             <true/>
           </dict>
           </plist>
           EOF
 
-          # --- Sign inside-out: frameworks → extensions → app ---
-
-          # Frameworks (if any)
+          # Sign inside-out
           if [ -d "$APP/Frameworks" ]; then
-            for fw in "$APP/Frameworks"/*.framework; do
-              [ -e "$fw" ] && codesign --force --sign - "$fw"
-            done
-            for dylib in "$APP/Frameworks"/*.dylib; do
-              [ -e "$dylib" ] && codesign --force --sign - "$dylib"
-            done
+            find "$APP/Frameworks" \( -name '*.framework' -o -name '*.dylib' \) \
+              -exec codesign --force --sign - {} \;
           fi
 
-          # Widget extension
           codesign --force --sign - \
             --entitlements /tmp/widgets.entitlements \
             "$APP/PlugIns/OpenMausCompanionWidgets.appex"
 
-          # Share extension
           codesign --force --sign - \
             --entitlements /tmp/share.entitlements \
             "$APP/PlugIns/OpenMausShareExtension.appex"
 
-          # Main app (last)
           codesign --force --sign - \
             --entitlements /tmp/app.entitlements \
             "$APP"
 
-          echo "✅ Ad-hoc signed with entitlements."
-          codesign -d --entitlements - "$APP" | head -30
+          echo "✅ Signed with entitlements"
 
       - name: Package into IPA
         run: |
           mkdir -p Payload
           cp -r ios/DerivedData/Build/Products/Release-iphoneos/OpenMausCompanion.app Payload/
           zip -qr OpenMausCompanion.ipa Payload
-          echo "✅ IPA packaged."
 
       - name: Upload IPA Artifact
         uses: actions/upload-artifact@v4
