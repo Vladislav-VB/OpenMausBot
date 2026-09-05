@@ -40,12 +40,110 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             build
 
+      # Вшиваем энтайтлменты ad-hoc подписью, чтобы Sideloadly их подхватил
+      - name: Ad-hoc sign with entitlements
+        working-directory: ios/DerivedData/Build/Products/Release-iphoneos
+        run: |
+          APP="OpenMausCompanion.app"
+
+          # --- Entitlements: Main App ---
+          cat > /tmp/app.entitlements << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>application-identifier</key>
+            <string>TEAM_ID.com.openmausbot.app</string>
+            <key>com.apple.security.application-groups</key>
+            <array>
+              <string>group.com.openmausbot.shared</string>
+            </array>
+            <key>keychain-access-groups</key>
+            <array>
+              <string>TEAM_ID.com.openmausbot.app</string>
+              <string>TEAM_ID.group.com.openmausbot.shared</string>
+            </array>
+            <key>get-task-allow</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+
+          # --- Entitlements: Share Extension ---
+          cat > /tmp/share.entitlements << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>application-identifier</key>
+            <string>TEAM_ID.com.openmausbot.app.share</string>
+            <key>com.apple.security.application-groups</key>
+            <array>
+              <string>group.com.openmausbot.shared</string>
+            </array>
+            <key>keychain-access-groups</key>
+            <array>
+              <string>TEAM_ID.group.com.openmausbot.shared</string>
+            </array>
+            <key>get-task-allow</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+
+          # --- Entitlements: Widgets ---
+          cat > /tmp/widgets.entitlements << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>application-identifier</key>
+            <string>TEAM_ID.com.openmausbot.app.widgets</string>
+            <key>get-task-allow</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+
+          # --- Sign inside-out: frameworks → extensions → app ---
+
+          # Frameworks (if any)
+          if [ -d "$APP/Frameworks" ]; then
+            for fw in "$APP/Frameworks"/*.framework; do
+              [ -e "$fw" ] && codesign --force --sign - "$fw"
+            done
+            for dylib in "$APP/Frameworks"/*.dylib; do
+              [ -e "$dylib" ] && codesign --force --sign - "$dylib"
+            done
+          fi
+
+          # Widget extension
+          codesign --force --sign - \
+            --entitlements /tmp/widgets.entitlements \
+            "$APP/PlugIns/OpenMausCompanionWidgets.appex"
+
+          # Share extension
+          codesign --force --sign - \
+            --entitlements /tmp/share.entitlements \
+            "$APP/PlugIns/OpenMausShareExtension.appex"
+
+          # Main app (last)
+          codesign --force --sign - \
+            --entitlements /tmp/app.entitlements \
+            "$APP"
+
+          echo "✅ Ad-hoc signed with entitlements."
+          codesign -d --entitlements - "$APP" | head -30
+
       - name: Package into IPA
         run: |
           mkdir -p Payload
           cp -r ios/DerivedData/Build/Products/Release-iphoneos/OpenMausCompanion.app Payload/
           zip -qr OpenMausCompanion.ipa Payload
-          echo "IPA packaged successfully."
+          echo "✅ IPA packaged."
 
       - name: Upload IPA Artifact
         uses: actions/upload-artifact@v4
