@@ -22,14 +22,13 @@ jobs:
       - name: Install XcodeGen
         run: brew install xcodegen
 
-      # Патч: добавляем runtime-определение team prefix для сайдлоада
-      - name: Patch OpenMausSharedConfiguration for sideloading
+      # ===== ПАТЧ 1: Определение team prefix из provisioning profile =====
+      - name: Patch OpenMausSharedConfiguration.swift
         run: |
           cat > ios/AppShared/OpenMausSharedConfiguration.swift << 'SWIFT'
           import Foundation
           import Security
 
-          /// Values shared by the main app and its extensions.
           enum OpenMausSharedConfiguration {
               static let appGroupIdentifier = "group.com.openmausbot.shared"
               static let legacyAppBundleIdentifier = "com.openmausbot.app"
@@ -39,26 +38,22 @@ jobs:
                   UserDefaults(suiteName: appGroupIdentifier)
               }
 
-              /// Fully-qualified keychain access group.
-              ///
-              /// Normal signed builds: reads the value Xcode expanded in Info.plist.
-              /// Sideloaded builds: $(AppIdentifierPrefix) is empty, so we discover
-              /// the team prefix at runtime by probing the keychain.
               static var keychainAccessGroup: String? {
+                  // 1) Normal signed build — Info.plist has the expanded value
                   if let value = Bundle.main.object(
                       forInfoDictionaryKey: keychainAccessGroupInfoKey
                   ) as? String {
-                      let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-                      if !trimmed.isEmpty, !trimmed.contains("$(") {
-                          // Contains a dot before the group name → prefix was expanded
-                          if trimmed != appGroupIdentifier {
-                              return trimmed
-                          }
+                      let t = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                      if !t.isEmpty, !t.contains("$("), t != appGroupIdentifier {
+                          return t
                       }
                   }
-                  // Fallback: derive from the signing team prefix
-                  guard let prefix = _discoveredTeamPrefix else { return nil }
-                  return "\(prefix)\(appGroupIdentifier)"
+                  // 2) Sideloaded — read team ID from provisioning profile
+                  if let prefix = _teamPrefix {
+                      return "\(prefix)\(appGroupIdentifier)"
+                  }
+                  // 3) Nothing worked — caller will use default group
+                  return nil
               }
 
               static var legacyAppKeychainAccessGroup: String? {
@@ -70,39 +65,196 @@ jobs:
 
               // MARK: - Team prefix discovery
 
-              /// Discover the signing team prefix by adding a disposable keychain
-              /// item and reading back the access group iOS assigned to it.
-              /// Evaluated once, cached for the process lifetime.
-              private static let _discoveredTeamPrefix: String? = {
-                  let svc = "com.openmausbot._prefix_probe"
-                  let acct = "_probe"
+              private static let _teamPrefix: String? = {
+                  // Method 1: embedded.mobileprovision (Sideloadly always embeds this)
+                  if let p = _prefixFromProfile() { return p }
+                  // Method 2: keychain probe
+                  if let p = _prefixFromKeychain() { return p }
+                  return nil
+              }()
+
+              private static func _prefixFromProfile() -> String? {
+                  guard let url = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision"),
+                        let data = try? Data(contentsOf: url),
+                        let raw = String(data: data, encoding: .ascii),
+                        let s = raw.range(of: "<?xml"),
+                        let e = raw.range(of: "</plist>") else { return nil }
+                  let xml = String(raw[s.lowerBound...e.upperBound])
+                  guard let xd = xml.data(using: .utf8),
+                        let pl = try? PropertyListSerialization.propertyList(from: xd, format: nil) as? [String: Any],
+                        let ids = pl["TeamIdentifier"] as? [String],
+                        let team = ids.first, !team.isEmpty else { return nil }
+                  return "\(team)."
+              }
+
+              private static func _prefixFromKeychain() -> String? {
+                  let svc = "com.openmausbot._pfx"
+                  let acct = "_p"
                   let base: [String: Any] = [
                       kSecClass as String: kSecClassGenericPassword,
                       kSecAttrService as String: svc,
                       kSecAttrAccount as String: acct,
                   ]
-                  // Remove any leftover from a previous run
                   SecItemDelete(base as CFDictionary)
-
-                  var addQuery = base
-                  addQuery[kSecValueData as String] = Data("p".utf8)
-                  addQuery[kSecReturnAttributes as String] = true
-
-                  var ref: CFTypeRef?
-                  let status = SecItemAdd(addQuery as CFDictionary, &ref)
+                  var add = base
+                  add[kSecValueData as String] = Data("x".utf8)
+                  _ = SecItemAdd(add as CFDictionary, nil)
                   defer { SecItemDelete(base as CFDictionary) }
+                  var fetch = base
+                  fetch[kSecReturnAttributes as String] = true
+                  fetch[kSecMatchLimit as String] = kSecMatchLimitOne
+                  var ref: CFTypeRef?
+                  guard SecItemCopyMatching(fetch as CFDictionary, &ref) == errSecSuccess,
+                        let a = ref as? [String: Any],
+                        let g = a[kSecAttrAccessGroup as String] as? String,
+                        let bid = Bundle.main.bundleIdentifier,
+                        g.hasSuffix(bid) else { return nil }
+                  return String(g.dropLast(bid.count))
+              }
+          }
+          SWIFT
 
-                  guard status == errSecSuccess,
-                        let attrs = ref as? [String: Any],
-                        let group = attrs[kSecAttrAccessGroup as String] as? String,
-                        let bundleID = Bundle.main.bundleIdentifier,
-                        group.hasSuffix(bundleID)
-                  else { return nil }
+      # ===== ПАТЧ 2: Если shared group недоступен — используем default (а не крашим) =====
+      - name: Patch OpenMausSharedKeychain.swift
+        run: |
+          cat > ios/AppShared/OpenMausSharedKeychain.swift << 'SWIFT'
+          import Foundation
+          import Security
 
-                  // group = "ABCDE12345.com.openmausbot.app"
-                  // prefix = "ABCDE12345."
-                  return String(group.dropLast(bundleID.count))
-              }()
+          enum OpenMausSharedKeychain {
+              private static let service = "com.openmausbot.companion.token"
+
+              static func save(_ token: String, for connectionID: String) throws {
+                  let group = OpenMausSharedConfiguration.keychainAccessGroup
+                  try save(Data(token.utf8), for: connectionID, accessGroup: group)
+              }
+
+              static func token(for connectionID: String) throws -> String? {
+                  let group = OpenMausSharedConfiguration.keychainAccessGroup
+                  return try readToken(for: connectionID, accessGroup: group)
+              }
+
+              @discardableResult
+              static func remove(_ connectionID: String) -> Bool {
+                  let group = OpenMausSharedConfiguration.keychainAccessGroup
+                  return remove(connectionID, accessGroup: group)
+              }
+
+              static func tokenMigratingLegacyItem(for connectionID: String) throws -> String? {
+                  if let shared = try token(for: connectionID) { return shared }
+                  let legacyGroup = OpenMausSharedConfiguration.legacyAppKeychainAccessGroup
+                  guard let legacy = try readToken(for: connectionID, accessGroup: legacyGroup) else {
+                      return nil
+                  }
+                  try save(legacy, for: connectionID)
+                  _ = remove(connectionID, accessGroup: legacyGroup)
+                  return legacy
+              }
+
+              @discardableResult
+              static func removeIncludingLegacyItem(_ connectionID: String) -> Bool {
+                  let sharedRemoved = remove(connectionID)
+                  guard let legacyGroup = OpenMausSharedConfiguration.legacyAppKeychainAccessGroup else {
+                      return sharedRemoved
+                  }
+                  let legacyRemoved = remove(connectionID, accessGroup: legacyGroup)
+                  return sharedRemoved || legacyRemoved
+              }
+
+              private static func identity(
+                  for connectionID: String,
+                  accessGroup: String?
+              ) -> [String: Any] {
+                  var q: [String: Any] = [
+                      kSecClass as String: kSecClassGenericPassword,
+                      kSecAttrService as String: service,
+                      kSecAttrAccount as String: connectionID,
+                  ]
+                  if let accessGroup {
+                      q[kSecAttrAccessGroup as String] = accessGroup
+                  }
+                  return q
+              }
+
+              private static func save(
+                  _ data: Data,
+                  for connectionID: String,
+                  accessGroup: String?
+              ) throws {
+                  let itemID = identity(for: connectionID, accessGroup: accessGroup)
+                  var query = itemID
+                  query[kSecValueData as String] = data
+                  query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+                  var status = SecItemAdd(query as CFDictionary, nil)
+                  if status == errSecDuplicateItem {
+                      status = SecItemUpdate(
+                          itemID as CFDictionary,
+                          [
+                              kSecValueData as String: data,
+                              kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+                          ] as CFDictionary
+                      )
+                      if status == errSecItemNotFound {
+                          status = SecItemAdd(query as CFDictionary, nil)
+                      }
+                  }
+                  guard status == errSecSuccess else {
+                      throw OpenMausSharedKeychainError.security(status)
+                  }
+              }
+
+              private static func readToken(
+                  for connectionID: String,
+                  accessGroup: String?
+              ) throws -> String? {
+                  var query = identity(for: connectionID, accessGroup: accessGroup)
+                  query[kSecReturnData as String] = true
+                  query[kSecMatchLimit as String] = kSecMatchLimitOne
+                  var item: CFTypeRef?
+                  let status = SecItemCopyMatching(query as CFDictionary, &item)
+                  if status == errSecItemNotFound { return nil }
+                  guard status == errSecSuccess else {
+                      throw OpenMausSharedKeychainError.security(status)
+                  }
+                  guard let data = item as? Data,
+                        let token = String(data: data, encoding: .utf8) else {
+                      throw OpenMausSharedKeychainError.security(errSecDecode)
+                  }
+                  return token
+              }
+
+              private static func remove(
+                  _ connectionID: String,
+                  accessGroup: String?
+              ) -> Bool {
+                  let status = SecItemDelete(
+                      identity(for: connectionID, accessGroup: accessGroup) as CFDictionary
+                  )
+                  return status == errSecSuccess || status == errSecItemNotFound
+              }
+          }
+
+          enum OpenMausSharedKeychainError: LocalizedError {
+              case configurationMissing
+              case security(OSStatus)
+
+              var errorDescription: String? {
+                  switch self {
+                  case .configurationMissing:
+                      return "Couldn't access the pairing securely: the shared keychain is not configured."
+                  case let .security(status):
+                      let detail = SecCopyErrorMessageString(status, nil) as String? ?? "status \(status)"
+                      return "Couldn't access the pairing securely: \(detail)"
+                  }
+                  
+              }
+
+              var isLocked: Bool {
+                  if case let .security(status) = self {
+                      return status == errSecInteractionNotAllowed
+                  }
+                  return false
+              }
           }
           SWIFT
 
@@ -138,16 +290,13 @@ jobs:
             <key>application-identifier</key>
             <string>TEAM.com.openmausbot.app</string>
             <key>com.apple.security.application-groups</key>
-            <array>
-              <string>group.com.openmausbot.shared</string>
-            </array>
+            <array><string>group.com.openmausbot.shared</string></array>
             <key>keychain-access-groups</key>
             <array>
               <string>TEAM.com.openmausbot.app</string>
               <string>TEAM.group.com.openmausbot.shared</string>
             </array>
-            <key>get-task-allow</key>
-            <true/>
+            <key>get-task-allow</key><true/>
           </dict>
           </plist>
           EOF
@@ -161,15 +310,10 @@ jobs:
             <key>application-identifier</key>
             <string>TEAM.com.openmausbot.app.share</string>
             <key>com.apple.security.application-groups</key>
-            <array>
-              <string>group.com.openmausbot.shared</string>
-            </array>
+            <array><string>group.com.openmausbot.shared</string></array>
             <key>keychain-access-groups</key>
-            <array>
-              <string>TEAM.group.com.openmausbot.shared</string>
-            </array>
-            <key>get-task-allow</key>
-            <true/>
+            <array><string>TEAM.group.com.openmausbot.shared</string></array>
+            <key>get-task-allow</key><true/>
           </dict>
           </plist>
           EOF
@@ -182,31 +326,22 @@ jobs:
           <dict>
             <key>application-identifier</key>
             <string>TEAM.com.openmausbot.app.widgets</string>
-            <key>get-task-allow</key>
-            <true/>
+            <key>get-task-allow</key><true/>
           </dict>
           </plist>
           EOF
 
-          # Sign inside-out
           if [ -d "$APP/Frameworks" ]; then
             find "$APP/Frameworks" \( -name '*.framework' -o -name '*.dylib' \) \
               -exec codesign --force --sign - {} \;
           fi
-
-          codesign --force --sign - \
-            --entitlements /tmp/widgets.entitlements \
+          codesign --force --sign - --entitlements /tmp/widgets.entitlements \
             "$APP/PlugIns/OpenMausCompanionWidgets.appex"
-
-          codesign --force --sign - \
-            --entitlements /tmp/share.entitlements \
+          codesign --force --sign - --entitlements /tmp/share.entitlements \
             "$APP/PlugIns/OpenMausShareExtension.appex"
-
-          codesign --force --sign - \
-            --entitlements /tmp/app.entitlements \
+          codesign --force --sign - --entitlements /tmp/app.entitlements \
             "$APP"
-
-          echo "✅ Signed with entitlements"
+          echo "✅ Signed"
 
       - name: Package into IPA
         run: |
