@@ -1,0 +1,56 @@
+name: Build iOS App
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'ios/**'
+
+jobs:
+  build:
+    name: Build Unsigned IPA
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Select Xcode version
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app || sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode Project
+        working-directory: ios
+        run: xcodegen generate
+
+      - name: Build App (unsigned)
+        working-directory: ios
+        run: |
+          xcodebuild \
+            -project OpenMausCompanion.xcodeproj \
+            -scheme OpenMausCompanion \
+            -configuration Release \
+            -sdk iphoneos \
+            -archivePath $RUNNER_TEMP/OpenMausCompanion.xcarchive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            archive
+
+      - name: Package into IPA
+        run: |
+          mkdir -p build/Payload
+          cp -r "$RUNNER_TEMP/OpenMausCompanion.xcarchive/Products/Applications/OpenMausCompanion.app" build/Payload/
+          cd build
+          zip -qr OpenMausCompanion.ipa Payload
+          echo "IPA packaged successfully."
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenMausCompanion-ipa
+          path: build/OpenMausCompanion.ipa
+          retention-days: 14
